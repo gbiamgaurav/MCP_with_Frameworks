@@ -150,6 +150,48 @@ set back to `--min-instances=0` — cold starts are acceptable for infrequent us
 
 ---
 
+## Deleting everything
+
+### Level 1 — Delete just the Cloud Run service
+```bash
+gcloud run services delete learning-mcp-server \
+  --region=us-central1 \
+  --project=<YOUR_PROJECT_ID>
+```
+
+### Level 2 — Delete Cloud Run + container images
+
+First check which Artifact Registry repo was actually created (it may be `cloud-run-source-deploy`, not `mcp-servers`):
+```bash
+gcloud artifacts repositories list \
+  --location=us-central1 \
+  --project=<YOUR_PROJECT_ID>
+```
+
+Then delete the correct repo:
+```bash
+gcloud artifacts repositories delete cloud-run-source-deploy \
+  --location=us-central1 \
+  --project=<YOUR_PROJECT_ID>
+```
+
+> **Note:** `gcloud run deploy --source` always stores images in `cloud-run-source-deploy`, not the `mcp-servers` repo created by the script.
+
+### Level 3 — Delete the entire GCP project (nuclear)
+```bash
+gcloud projects delete <YOUR_PROJECT_ID>
+```
+Removes everything — Cloud Run, Artifact Registry, billing. **Irreversible after 30 days.**
+Can be undone within the grace period with:
+```bash
+gcloud projects undelete <YOUR_PROJECT_ID>
+```
+
+### Clean up Claude Desktop
+Remove the `learn-mcp-server` entry from `~/Library/Application Support/Claude/claude_desktop_config.json`, then restart Claude Desktop.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
