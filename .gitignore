@@ -203,6 +203,10 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# ADK session state
+.adk/
+*.db
+
 # Ruff stuff:
 .ruff_cache/
 

@@ -1,0 +1,4 @@
+# ADK + MCP learning module dependencies
+google-adk>=1.0.0
+mcp>=1.3.0
+python-dotenv>=1.0.0
