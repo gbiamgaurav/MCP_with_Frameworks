@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Multi-Agent Monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+
+    header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 16px; color: #58a6ff; }
+    input { flex: 1; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 12px; border-radius: 6px; font-size: 14px; font-family: monospace; }
+    button { background: #238636; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #2ea043; }
+    button.stop { background: #da3633; }
+    button.stop:hover { background: #f85149; }
+
+    #status { font-size: 12px; color: #8b949e; padding: 0 4px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #8b949e; display: inline-block; margin-right: 6px; }
+    .dot.live { background: #3fb950; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    main { display: flex; flex: 1; overflow: hidden; }
+
+    /* Event feed */
+    #feed { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+    .event { border-radius: 6px; padding: 10px 14px; border-left: 3px solid #30363d; background: #161b22; font-size: 13px; line-height: 1.5; }
+    .event.supervisor  { border-color: #8b949e; }
+    .event.agent_start { border-color: #58a6ff; }
+    .event.tool_call   { border-color: #d29922; }
+    .event.tool_result { border-color: #3fb950; }
+    .event.agent_done  { border-color: #a371f7; }
+    .event.workflow_done{ border-color: #3fb950; background: #0d2818; }
+    .event.error       { border-color: #f85149; background: #1c0c0c; }
+
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-right: 8px; }
+    .tag.supervisor  { background:#30363d; color:#8b949e; }
+    .tag.agent_start { background:#0c2d6b; color:#58a6ff; }
+    .tag.tool_call   { background:#2d1f00; color:#d29922; }
+    .tag.tool_result { background:#0d2818; color:#3fb950; }
+    .tag.agent_done  { background:#1b0e36; color:#a371f7; }
+    .tag.workflow_done{background:#0d2818; color:#3fb950; }
+    .tag.error       { background:#1c0c0c; color:#f85149; }
+
+    .preview { color:#8b949e; font-size:12px; margin-top:4px; word-break:break-word; }
+
+    /* Final post panel */
+    #result { width: 420px; border-left: 1px solid #30363d; overflow-y: auto; padding: 16px; display: none; }
+    #result h2 { font-size: 13px; color: #58a6ff; margin-bottom: 12px; }
+    #result pre { white-space: pre-wrap; font-size: 12px; line-height: 1.6; color: #c9d1d9; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Multi-Agent Monitor</h1>
+  <input id="topicInput" type="text" placeholder="Enter topic (e.g. quantum computing)" value="quantum computing" />
+  <button id="runBtn" onclick="startStream()">Run</button>
+  <span id="status"><span class="dot" id="dot"></span><span id="statusText">idle</span></span>
+</header>
+
+<main>
+  <div id="feed"></div>
+  <div id="result">
+    <h2>Final Post</h2>
+    <pre id="resultText"></pre>
+  </div>
+</main>
+
+<script>
+  let es = null;
+
+  function startStream() {
+    const topic = document.getElementById('topicInput').value.trim();
+    if (!topic) return;
+
+    // Reset
+    document.getElementById('feed').innerHTML = '';
+    document.getElementById('result').style.display = 'none';
+    document.getElementById('resultText').textContent = '';
+    if (es) es.close();
+
+    setStatus('connecting...', false);
+    document.getElementById('runBtn').textContent = 'Stop';
+    document.getElementById('runBtn').className = 'stop';
+    document.getElementById('runBtn').onclick = stopStream;
+
+    es = new EventSource(`/stream?topic=${encodeURIComponent(topic)}`);
+
+    es.onmessage = (e) => {
+      const event = JSON.parse(e.data);
+      renderEvent(event);
+      if (event.type === 'workflow_done' || event.type === 'error') {
+        es.close();
+        setStatus('done', false);
+        resetBtn();
+        if (event.type === 'workflow_done') showResult(event.final_post);
+      }
+    };
+
+    es.onopen = () => setStatus('live', true);
+    es.onerror = () => { setStatus('error', false); resetBtn(); };
+  }
+
+  function stopStream() {
+    if (es) { es.close(); es = null; }
+    setStatus('stopped', false);
+    resetBtn();
+  }
+
+  function resetBtn() {
+    const btn = document.getElementById('runBtn');
+    btn.textContent = 'Run';
+    btn.className = '';
+    btn.onclick = startStream;
+  }
+
+  function setStatus(text, live) {
+    document.getElementById('statusText').textContent = text;
+    document.getElementById('dot').className = live ? 'dot live' : 'dot';
+  }
+
+  function renderEvent(ev) {
+    const feed = document.getElementById('feed');
+    const div = document.createElement('div');
+
+    let cssClass = ev.type;
+    if (ev.type === 'supervisor_route') cssClass = 'supervisor';
+
+    div.className = `event ${cssClass}`;
+
+    let label = ev.type;
+    let body = '';
+
+    if (ev.type === 'supervisor_route') {
+      label = 'supervisor';
+      body = `<strong>${ev.from}</strong> &rarr; <strong>${ev.to}</strong>`;
+    } else if (ev.type === 'agent_start') {
+      label = 'agent_start';
+      body = `<strong>${ev.agent}</strong> is starting...`;
+    } else if (ev.type === 'tool_call') {
+      label = 'tool_call';
+      body = `<strong>web_search</strong>(<span style="color:#79c0ff">${escHtml(ev.query)}</span>)`;
+    } else if (ev.type === 'tool_result') {
+      label = 'tool_result';
+      body = `<strong>${ev.query}</strong>`;
+      if (ev.preview) body += `<div class="preview">${escHtml(ev.preview.slice(0, 200))}...</div>`;
+    } else if (ev.type === 'agent_done') {
+      label = 'agent_done';
+      body = `<strong>${ev.agent}</strong> — ${escHtml(ev.summary || '')}`;
+    } else if (ev.type === 'workflow_done') {
+      label = 'done';
+      body = `Workflow complete. Final post ready.`;
+    } else if (ev.type === 'error') {
+      label = 'error';
+      body = escHtml(ev.message || 'Unknown error');
+    }
+
+    div.innerHTML = `<span class="tag ${cssClass}">${label}</span>${body}`;
+    feed.appendChild(div);
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  function showResult(text) {
+    document.getElementById('result').style.display = 'block';
+    document.getElementById('resultText').textContent = text;
+  }
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+</script>
+</body>
+</html>
