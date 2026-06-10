@@ -18,6 +18,8 @@
 9. [Agent Skills and Hooks](#9-agent-skills-and-hooks)
 10. [Guardrails](#10-guardrails)
 11. [Connecting the Dots — How Everything Fits Together](#11-connecting-the-dots)
+12. [Tool Selection Accuracy & Concurrent Context Isolation](#12-tool-selection-accuracy--concurrent-context-isolation)
+13. [When to Use Which Framework](#13-when-to-use-which-framework)
 
 ---
 
@@ -1345,6 +1347,536 @@ Currently your agents communicate:
 What's missing: **agent-to-agent delegation across process/network boundaries**.
 
 With A2A, module 04's `supervisor` could HTTP-call a separately deployed `ResearchAgent`, which internally uses its own LangGraph pipeline + MCP tools. The supervisor wouldn't know or care how the research was done — it just sends a task and gets a result. This is the direction the entire industry is moving.
+
+---
+
+---
+
+## 12. Tool Selection Accuracy & Concurrent Context Isolation
+
+### Why These Two Problems Are Critical in Production
+
+Two failure modes dominate real MCP/agent deployments:
+
+1. **Wrong tool called** — agent picks `get_weather` when it should call `get_forecast`, or calls no tool when it should. Silent failures that degrade output quality without throwing exceptions.
+2. **Context bleed** — one user's session state leaks into another user's request. Rare in dev (single user), catastrophic in production (data privacy, wrong answers, unpredictable behavior).
+
+---
+
+### Part A — Ensuring the Agent Calls the Correct Tool
+
+#### The Root Cause: LLM Uses Descriptions, Not Logic
+
+The model has no "routing table." It compares the user message against every tool's name + description and picks based on semantic similarity. If descriptions are ambiguous or overlap, wrong tool selection is guaranteed at scale.
+
+#### 1. Description Engineering (Highest Leverage)
+
+Descriptions written for human readers often fail as LLM retrieval targets. Structure descriptions with explicit semantic fields:
+
+```python
+@mcp.tool()
+def get_current_weather(city: str) -> dict:
+    """
+    Get CURRENT (real-time) weather conditions for a city right now.
+    
+    WHEN TO USE: user asks about current/live/today's weather conditions.
+    DO NOT USE: if user asks about forecast, historical data, or weekly outlook — 
+                use `get_weather_forecast` instead.
+    
+    Tags: weather, real-time, current, conditions
+    
+    Args:
+        city: City name, e.g. "London" or "New York"
+    Returns:
+        dict with temp_celsius, humidity, description, wind_kph
+    """
+```
+
+Research shows adding `when_to_use`, `tags`, and explicit anti-examples (when NOT to use) yields larger retrieval accuracy improvements than rewriting the base description alone.
+
+#### 2. Tool Namespacing
+
+Group related tools under common prefixes so the LLM can discriminate by category before selecting within a group:
+
+```python
+# Bad — ambiguous boundaries
+def read(...)
+def write(...)
+def delete(...)
+
+# Good — namespace by service + resource
+def db_user_read(...)
+def db_user_write(...)
+def db_order_read(...)
+def fs_file_read(...)
+def fs_file_write(...)
+```
+
+Namespacing encodes the tool's domain in its name. The LLM resolves to the right namespace first, then selects within it.
+
+#### 3. Scale-Tiered Tool Selection Strategy
+
+| Tool count | Strategy |
+|-----------|----------|
+| **< 15 tools** | Static inclusion: send all schemas every call. Invest only in description quality. |
+| **15–40 tools** | Semantic retrieval: embed all tool descriptions, retrieve top-K by cosine similarity to query. Hybrid score = semantic + keyword. |
+| **40+ tools** | Layered routing: intent classifier → namespace filter → semantic retrieval → context-conditioned re-ranking. |
+
+Your project currently has 4–5 tools per server (well under 15) — static inclusion is correct. As you add Azure/AWS modules, this threshold becomes relevant.
+
+#### 4. Active Tool Discovery (MCP-Zero Pattern)
+
+For very large tool catalogs (1000+ tools), don't send all schemas upfront — it bloats the context window and degrades selection accuracy. Instead, the agent actively requests tools when it identifies a capability gap:
+
+```
+Agent: "I need to check the user's balance. I don't have a tool for that."
+  → requests tool discovery for "balance" 
+  → server returns matching tool schemas
+  → agent calls the specific tool
+```
+
+MCP-Zero demonstrates 98% token reduction versus sending 3k tool schemas upfront, with improved selection accuracy. FastMCP's `@mcp.resource()` can back a tool-discovery endpoint for this pattern.
+
+#### 5. Distractor Tool Testing
+
+Before deploying, test that your agent correctly discriminates between similar tools. Build test cases where the correct tool and a "distractor" (similar name/description) are both present:
+
+```python
+# Test: with both get_weather and get_forecast available,
+# "What's the weather like right now?" → must call get_weather, not get_forecast
+# "Will it rain on Friday?" → must call get_forecast, not get_weather
+```
+
+MCPAgentBench benchmarks use exactly this pattern. Gemini-3-Flash currently achieves ~55% vs human 94% — meaning distractor failures are common and must be tested explicitly.
+
+#### 6. Structured Output Enforcement
+
+Force the model to emit valid tool call syntax via structured outputs. This prevents "hallucinated tools" (model invents a non-existent tool name):
+
+- **ADK**: Gemini function-calling enforces structured tool calls natively — the model can only call tools it was given schemas for.
+- **LangGraph**: Bind tools to the LLM via `.bind_tools([...])` on the `ChatModel`. The model's output is constrained to the bound tool schemas.
+- Never parse free-text tool calls — always use the framework's native tool-binding.
+
+#### 7. `before_tool_callback` as Last-Resort Validation
+
+Even after good descriptions, add an ADK hook to catch obviously wrong tool calls:
+
+```python
+def validate_tool_choice(ctx, tool_call) -> dict | None:
+    tool_name = tool_call.function_call.name
+    args = tool_call.function_call.args
+    
+    # Guard: calculate should never receive non-math strings
+    if tool_name == "calculate":
+        expr = args.get("expression", "")
+        if not any(c.isdigit() or c in "+-*/()^." for c in expr):
+            return {"error": "calculate requires a mathematical expression"}
+    
+    return None  # allow
+```
+
+This is a narrow fallback, not a substitute for good descriptions.
+
+---
+
+### Part B — Context Isolation for Concurrent Users
+
+#### The Core Problem
+
+Unlike stateless REST APIs, MCP sessions **accumulate state over time** — conversation history, tool results, intermediate reasoning, user-specific context. When multiple users hit the same server concurrently, that state must be completely isolated per session.
+
+Failure modes without isolation:
+- User A's search results appear in User B's response
+- Tool call history from session 1 affects tool selection in session 2
+- Memory/state exhaustion when sessions are never cleaned up
+
+#### 1. Session ID as the Isolation Boundary
+
+MCP Streamable HTTP transport uses the `mcp-session-id` HTTP header as the isolation key. Every session gets a unique ID at connection time; all state is keyed by it:
+
+```python
+# FastMCP / Streamable HTTP — each connection is a separate
+# StreamableHTTPServerTransport instance, automatically keyed by session ID.
+# You don't have to do anything special — the transport handles it.
+# BUT: any state YOU store (dicts, lists outside the transport) must also be keyed.
+
+# WRONG — shared global state, bleeds between users:
+search_cache = {}  # module-level
+
+# RIGHT — per-session state:
+session_caches: dict[str, dict] = {}  # keyed by session_id
+
+@mcp.tool()
+def cached_search(query: str, ctx: Context) -> dict:
+    session_id = ctx.client_id  # FastMCP provides this
+    if session_id not in session_caches:
+        session_caches[session_id] = {}
+    ...
+```
+
+#### 2. ADK Session Isolation (`InMemorySessionService`)
+
+ADK's session service already isolates by `session_id`. Each `runner.run()` call takes a `session_id` — never reuse IDs across users:
+
+```python
+# In production: generate a fresh UUID per user per conversation
+import uuid
+session_id = str(uuid.uuid4())
+
+session = await session_service.create_session(
+    app_name="my_app",
+    user_id=user_id,      # scopes to user
+    session_id=session_id  # scopes to conversation
+)
+```
+
+`InMemorySessionService` works for development. For multiple server instances behind a load balancer, switch to `DatabaseSessionService` — otherwise sessions are lost when requests route to different instances.
+
+#### 3. LangGraph Per-Session Isolation (`thread_id`)
+
+LangGraph's checkpointer uses `thread_id` as the isolation key. Always pass a per-user `thread_id` in the config:
+
+```python
+checkpointer = MemorySaver()  # dev; use SqliteSaver or PostgresSaver in prod
+compiled = graph.compile(checkpointer=checkpointer)
+
+# Each user/session gets its own thread_id — state never crosses between them
+config = {"configurable": {"thread_id": f"user_{user_id}_session_{session_id}"}}
+result = compiled.invoke(initial_state, config=config)
+```
+
+Without `thread_id`, all invocations share the same checkpoint — the most common cause of context bleed in LangGraph production deployments.
+
+#### 4. Storage Backend by Scale
+
+| Deployment | Storage backend | Notes |
+|-----------|----------------|-------|
+| Single instance, dev | In-memory dict / `MemorySaver` | Lost on restart, no limits |
+| Single instance, prod | SQLite / `SqliteSaver` | Persistent, no multi-instance |
+| Multi-instance (load balanced) | Redis / PostgreSQL | Required — shared state across instances |
+| Very high volume | Redis Cluster + TTL expiry | Auto-expire stale sessions |
+
+Rule: if you run more than one server replica (Cloud Run min-instances > 1), in-memory state is wrong by definition. Context will bleed based on which replica handles each request.
+
+#### 5. Context Window Bloat Under Concurrency
+
+With many concurrent users, each user's session accumulates tool call history, conversation turns, and tool schemas — all in their context window. Two compounding risks:
+
+**Tool schema bloat:** Sending all tool schemas every turn consumes tokens from every concurrent session's context. With 50 concurrent users × 40 tool schemas × 300 tokens each = 600K tokens per second just for tool schemas.
+
+Mitigation: retrieve only relevant tool schemas per request (RAG-MCP pattern):
+```python
+# Instead of: inject all 40 tool schemas
+# Do: embed query, retrieve top-5 tool schemas by cosine similarity, inject only those
+relevant_tools = tool_retriever.search(user_message, k=5)
+agent.run(user_message, tools=relevant_tools)
+```
+
+**History accumulation:** Each turn adds to the session's message history. Long sessions exhaust the context window.
+
+Mitigation: periodic summarization or a sliding window:
+```python
+class BlogState(TypedDict):
+    # Keep only last N messages, not full history
+    messages: Annotated[list, lambda old, new: (old + new)[-20:]]
+```
+
+#### 6. Isolation Validation (Test Before Shipping)
+
+Actively test that context isolation works before going to production:
+
+```python
+import asyncio
+
+async def test_session_isolation():
+    # Fire two concurrent sessions
+    session_a = asyncio.create_task(run_agent("user_A", "What is 2+2?"))
+    session_b = asyncio.create_task(run_agent("user_B", "My name is Alice"))
+    
+    result_a, result_b = await asyncio.gather(session_a, session_b)
+    
+    # Session A must not know Alice
+    assert "Alice" not in result_a["final_response"]
+    # Session B's math context must not pollute Session A
+    assert result_b["session_state"].get("user_A_data") is None
+```
+
+This is the minimum bar. Run this test with real concurrent load (10+ simultaneous users) before any public deployment.
+
+#### 7. Session Lifecycle Management
+
+Sessions without cleanup cause memory exhaustion under sustained load. Implement TTL-based expiry:
+
+```python
+import time
+
+SESSION_TTL_SECONDS = 3600  # 1 hour
+
+# Track last-accessed time per session
+session_last_seen: dict[str, float] = {}
+
+def cleanup_stale_sessions():
+    now = time.time()
+    stale = [sid for sid, ts in session_last_seen.items() 
+             if now - ts > SESSION_TTL_SECONDS]
+    for sid in stale:
+        del session_caches[sid]
+        del session_last_seen[sid]
+```
+
+With Redis backend, set a TTL key on every session write — Redis handles expiry automatically.
+
+#### 8. Performance Baseline
+
+Typical Streamable HTTP MCP server on a 4-core machine:
+- **50+ concurrent clients** at sub-100ms response times
+- **~10–15 connections per CPU core** before latency degrades
+- **LangGraph `ainvoke()`** (async, non-blocking) is required for concurrent sessions — synchronous `invoke()` blocks the event loop and serializes all users
+
+Your module 03 uses `ainvoke()` throughout — correct. Your module 04 `api.py` SSE streaming is also async — correct.
+
+### Summary: What to Add to Your Project
+
+| Gap | Fix | Priority |
+|-----|-----|----------|
+| No distractor tool tests | Add pytest cases with overlapping tools | High |
+| Global state in MCP tools | Key any shared dicts by `ctx.client_id` | High |
+| `InMemorySessionService` in ADK | Switch to `DatabaseSessionService` for Cloud Run multi-replica | Medium |
+| LangGraph missing `thread_id` in module 04 | Pass `{"configurable": {"thread_id": session_id}}` to every `invoke()` / `stream()` | High |
+| No session expiry | Add TTL cleanup or Redis with key expiry | Medium |
+| All tool schemas sent every turn | Implement RAG-MCP if tool count exceeds 15 | Low (not yet needed) |
+
+---
+
+---
+
+## 13. When to Use Which Framework
+
+> Decision guide for LangGraph · ADK · A2A · CrewAI · AutoGen. Each solves a different problem. Picking the wrong one means rewriting — picking based on hype means the same.
+
+### The One-Line Positioning
+
+| Framework | Core mental model | Problem it solves |
+|-----------|------------------|-------------------|
+| **LangGraph** | Explicit directed graph | Fine-grained stateful workflows with cycles, branches, human-in-the-loop |
+| **ADK** | Declarative agent tree | Production GCP-native agents with minimal boilerplate |
+| **CrewAI** | Role-playing team | Rapid role-based pipelines where workflow is mostly linear |
+| **AutoGen (AG2)** | Conversational agents | Research, debate, open-ended multi-agent reasoning |
+| **A2A** | HTTP agent protocol | Cross-vendor/cross-cloud agent-to-agent communication |
+
+A2A is not a framework — it's a protocol layer you run *on top* of any framework. The other four are frameworks. You will likely use A2A alongside one of the four, not instead of them.
+
+---
+
+### LangGraph
+
+**Use when:**
+- Workflow has **cycles, loops, or conditional branching** (your module 04 editor quality loop is the canonical example)
+- You need **checkpointing** — pause, resume, or restart mid-graph after failure
+- **Human-in-the-loop** is required — `interrupt_before`/`interrupt_after` a specific node
+- Production observability is non-negotiable — LangSmith traces every node, token count, latency
+- Team is engineering-focused and values explicit control over convenience
+- Failures are expensive (financial services, healthcare, legal workflows)
+
+**Enterprise signal:** LangGraph runs in production at Klarna, Uber, LinkedIn, BlackRock, JPMorgan, Replit. 34% of production agent frameworks in enterprise architecture docs as of Q1 2026 (Gartner).
+
+**Don't use when:**
+- Workflow is linear and simple — LangGraph's graph-wiring overhead is unwarranted
+- Team is small and time-to-prototype matters more than control
+- You're on GCP and all agents use Gemini — ADK gets you there faster
+
+**The cost:** Highest learning curve. You wire every edge explicitly. No magic. But every behavior is visible, testable, and traceable. Worth it when you're past prototyping.
+
+```python
+# LangGraph: explicit, surgical control
+g.add_conditional_edges("editor", route, {"publish": "publisher", "rewrite": "writer"})
+# You know exactly what happens. No hidden behavior.
+```
+
+---
+
+### Google ADK
+
+**Use when:**
+- Deploying on **GCP** (Cloud Run, GKE, Vertex AI Agent Engine)
+- Primary model is **Gemini** (ADK is optimized for it, but supports others)
+- Want **declarative multi-agent** setup without drawing graphs: `SequentialAgent`, `ParallelAgent`, `LoopAgent`
+- Need **native MCP support** out of the box (`MCPToolset`)
+- Want the **Vertex AI managed runtime** (Agent Engine GA) — fully managed sessions, memory, scaling
+- Your `adk web` dev loop matters — ADK's UI is the best first-party dev experience
+
+**Don't use when:**
+- Deploying on Azure or AWS as primary cloud — ADK's managed runtime is GCP-only; you can containerize, but lose the managed benefits
+- You need complex conditional routing that doesn't fit SequentialAgent/ParallelAgent/LoopAgent shapes — LangGraph is more flexible
+- Framework-agnostic portability is a hard requirement
+
+**The cost:** GCP vendor alignment. Session state via `InMemorySessionService` → `DatabaseSessionService` → `VertexAiSessionService` is a clear upgrade path, but each step binds you further to GCP.
+
+```python
+# ADK: describe what agents are, not how they connect
+root_agent = SequentialAgent(sub_agents=[researcher, analyst, reporter])
+# SequentialAgent handles the wiring for you
+```
+
+**Planned in your project:** Module 05 (Azure), 06 (AWS) will expose where ADK's GCP assumptions create friction.
+
+---
+
+### CrewAI
+
+**Use when:**
+- Need a **working multi-agent pipeline in a day** — 35 lines of code, role/task/process model
+- Workflow maps naturally to **team roles**: researcher, writer, reviewer, editor
+- **Non-technical stakeholders** need to read and approve agent definitions — CrewAI's DSL reads like a job description, not code
+- Workflow is **mostly sequential** — CrewAI handles linear pipelines cleanly
+- Building: content pipelines, report generation, standardized approval workflows, QA systems
+
+**Concrete token advantage:** CrewAI uses 15–20% fewer tokens than LangGraph for sequential workflows because it doesn't carry full graph state between every step.
+
+**Don't use when:**
+- Workflow requires **cycles or complex branching** — CrewAI's graph support is limited vs LangGraph
+- Production observability is critical — no native equivalent of LangSmith
+- You need **fine-grained state control** per agent turn
+- Task routing logic is dynamic (not deterministic at design time)
+
+**The cost:** What you gain in speed, you lose in control. Production debugging is harder than LangGraph. Observability requires third-party integration.
+
+```python
+# CrewAI: reads like an org chart
+crew = Crew(
+    agents=[researcher, writer, editor],
+    tasks=[research_task, write_task, edit_task],
+    process=Process.sequential
+)
+```
+
+---
+
+### AutoGen (AG2)
+
+**Use when:**
+- Building **research automation**, fact-checking, or tasks where agents need to debate/critique each other
+- Workflow **can't be fully predefined** — agents negotiate what to do next
+- Complex **coding tasks** where a reviewer agent catches errors the writer missed (43% debugging time reduction in Microsoft Research study)
+- Exploring multi-agent patterns in a **research or experimental context**
+- Microsoft ecosystem alignment
+
+**Concrete token advantage:** AutoGen uses 25–30% fewer tokens than LangGraph for complex reasoning tasks due to its conversational compression.
+
+**Critical production risk:** AutoGen has had 3 major architectural rewrites in under 2 years. Code written on v0.2 requires a migration plan. Major feature development has shifted — the codebase is community-driven with no commercial platform backing. **Do not adopt AutoGen for a new production system without a documented migration plan.**
+
+**Don't use when:**
+- Building high-volume, real-time systems — every agent turn sends the full accumulated conversation history to the LLM; cost explodes with traffic
+- You need native observability — there is no first-party equivalent of LangSmith
+- Stability and long-term support are requirements — evaluate AG2's community vs LangGraph's LangChain Inc. backing explicitly
+
+```python
+# AutoGen: agents converse, not flow through a graph
+user_proxy.initiate_chat(assistant, message="Review this code for security issues")
+# Agents negotiate next steps through natural language
+```
+
+---
+
+### A2A Protocol
+
+**A2A is not a framework replacement — it is the communication layer between agents that live in different services, frameworks, or organizations.**
+
+**Use when:**
+- Agents are owned by **different teams or vendors** and can't share a runtime
+- You're breaking a monolithic multi-agent system into **independent deployable services**
+- Need **cross-cloud agent delegation** (ADK agent on GCP calling a LangGraph agent on Azure)
+- Building an **enterprise multi-agent system** where the routing agent doesn't know how sub-agents are implemented internally
+
+**In practice today (2026):**
+- 150+ orgs run A2A in production: Salesforce, SAP, ServiceNow, Deutsche Bank
+- Native support in ADK, LangGraph, CrewAI, LlamaIndex, Semantic Kernel
+- Governed by Linux Foundation / AAIF alongside MCP
+- v1.2 is stable
+
+**Don't use when:**
+- All agents live in the same process — JSON-RPC overhead is unwarranted when you can call a function directly
+- Simple tool calling is sufficient — if one agent just calls a function, use MCP, not A2A
+- You're still in prototyping — add A2A when you're splitting services, not before
+
+**MCP vs A2A decision rule:**
+
+```
+Agent needs external data or function execution → MCP
+Agent needs to delegate a task to another autonomous agent → A2A
+```
+
+**The evolution path in your project:**
+
+```
+Module 04 today (intra-process)          →   A2A-ready (inter-service)
+─────────────────────────────────────────────────────────────────────
+supervisor function in same process      →   Supervisor agent with A2A client
+researcher/writer/editor functions       →   Independent Cloud Run services
+LangGraph edges = routing                →   HTTP POST to A2A endpoints
+BlogState TypedDict = shared state       →   Each service holds own state; 
+                                             results passed via A2A Task objects
+```
+
+---
+
+### Decision Flowchart
+
+```
+Start: What's your primary deployment target?
+│
+├─ GCP (Cloud Run / Vertex / GKE) + Gemini as primary model?
+│   └─ YES → ADK
+│       └─ Need cycles/custom routing ADK doesn't support?
+│           └─ YES → ADK outer shell + LangGraph inside tools (your module 03 pattern)
+│
+├─ Need working prototype fast with role-based workflow?
+│   └─ YES → CrewAI
+│       └─ Hitting observability/control limits?
+│           └─ YES → migrate to LangGraph
+│
+├─ Complex conditional graph, loops, human-in-the-loop, production enterprise?
+│   └─ YES → LangGraph
+│
+├─ Research automation, conversational multi-agent, debate/critique patterns?
+│   └─ YES → AutoGen (AG2) — but document your migration plan
+│
+└─ Agents need to talk across service/org/vendor boundaries?
+    └─ YES → A2A on top of whichever framework above
+```
+
+---
+
+### Combination Patterns (What Actually Works)
+
+| Pattern | When to use | Example |
+|---------|------------|---------|
+| **LangGraph inside MCP tool** | Complex pipeline you want any agent to call | Module 03: `review_code` MCP tool is a 6-node LangGraph |
+| **ADK + MCP** | GCP agent consuming external tools | Module 01: ADK agent calls FastMCP server |
+| **CrewAI + A2A** | Linear role workflow that needs to call external agents | CrewAI crew delegates research task to external A2A service |
+| **LangGraph + A2A** | Supervisor graph where sub-agents are separate services | Module 04 evolution: supervisor HTTP-calls researcher service |
+| **ADK + LangGraph** | ADK for outer agent lifecycle; LangGraph for complex inner computation | ADK `SequentialAgent` where one sub-agent internally runs a StateGraph |
+
+---
+
+### The Honest Summary Table
+
+| | LangGraph | ADK | CrewAI | AutoGen | A2A |
+|--|-----------|-----|--------|---------|-----|
+| **Learning curve** | High | Medium | Low | Medium | Medium |
+| **Production readiness** | Highest | High (GCP) | Medium | Medium-Low | High (v1.2) |
+| **Observability** | LangSmith (best-in-class) | ADK web UI, Vertex | Third-party needed | None native | Per-framework |
+| **Loops / cycles** | Native | LoopAgent (limited) | Limited | Native (conversational) | N/A |
+| **Cloud agnostic** | Yes | No (GCP-native) | Yes | Yes | Yes |
+| **Best for** | Production enterprise | GCP + Gemini | Rapid role-based | Research / conversational | Cross-service comms |
+| **Avoid when** | Simple linear workflow | Non-GCP cloud | Complex branching | High-volume real-time | Same-process agents |
+| **Stability risk** | Low | Low-Medium | Low | **HIGH (3 rewrites)** | Low (Linux Foundation) |
+
+**Your project's framework decisions are correct:**
+- Module 01: ADK (GCP + Gemini + MCP native = ADK's sweet spot)
+- Module 03: LangGraph as MCP tools (complex pipelines needing explicit state)
+- Module 04: LangGraph (conditional routing, quality loops, streaming — exactly what LangGraph is for)
+- Next: A2A to federate module 04 agents into independent services
 
 ---
 
